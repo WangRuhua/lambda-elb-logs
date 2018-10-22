@@ -15,12 +15,13 @@ def lambda_handler(event, context):
 	R = re.compile(ELB_REGEX)
 	R2 = re.compile(ELB_REGEX_2)
 
-	ES_HOST = "elb_endpoint"
+	ES_HOST = environ['ELASTIC_ENDPOINT']
+	ES_REGION = environ['ES_REGION']
 	INDEX_PREFIX = ""
-	BUCKET_NAME = "bucket_name"
+	BUCKET_NAME = environ['BUCKET_NAME']
 
 	auth = BotoAWSRequestsAuth(aws_host=ES_HOST,
-						   aws_region='us-east-1',
+						   aws_region=ES_REGION,
 						   aws_service='es')
 	es = Elasticsearch(host=ES_HOST, port=443, use_ssl=True, ca_certs=certifi.where(), connection_class=RequestsHttpConnection, http_auth=auth)
 	actions = []
