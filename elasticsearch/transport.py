@@ -1,11 +1,32 @@
+#  Licensed to Elasticsearch B.V. under one or more contributor
+#  license agreements. See the NOTICE file distributed with
+#  this work for additional information regarding copyright
+#  ownership. Elasticsearch B.V. licenses this file to you under
+#  the Apache License, Version 2.0 (the "License"); you may
+#  not use this file except in compliance with the License.
+#  You may obtain a copy of the License at
+#
+# 	http://www.apache.org/licenses/LICENSE-2.0
+#
+#  Unless required by applicable law or agreed to in writing,
+#  software distributed under the License is distributed on an
+#  "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+#  KIND, either express or implied.  See the License for the
+#  specific language governing permissions and limitations
+#  under the License.
+
 import time
 from itertools import chain
 
 from .connection import Urllib3HttpConnection
-from .connection_pool import ConnectionPool, DummyConnectionPool
+from .connection_pool import ConnectionPool, DummyConnectionPool, EmptyConnectionPool
 from .serializer import JSONSerializer, Deserializer, DEFAULT_SERIALIZERS
-from .exceptions import ConnectionError, TransportError, SerializationError, \
-                        ConnectionTimeout
+from .exceptions import (
+    ConnectionError,
+    TransportError,
+    SerializationError,
+    ConnectionTimeout,
+)
 
 
 def get_host_info(node_info, host):
@@ -23,9 +44,10 @@ def get_host_info(node_info, host):
     :arg host: connection information (host, port) extracted from the node info
     """
     # ignore master only nodes
-    if node_info.get('roles', []) == ['master']:
+    if node_info.get("roles", []) == ["master"]:
         return None
     return host
+
 
 class Transport(object):
     """
@@ -34,22 +56,38 @@ class Transport(object):
 
     Main interface is the `perform_request` method.
     """
-    def __init__(self, hosts, connection_class=Urllib3HttpConnection,
-        connection_pool_class=ConnectionPool, host_info_callback=get_host_info,
-        sniff_on_start=False, sniffer_timeout=None, sniff_timeout=.1,
-        sniff_on_connection_fail=False, serializer=JSONSerializer(), serializers=None,
-        default_mimetype='application/json', max_retries=3, retry_on_status=(502, 503, 504, ),
-        retry_on_timeout=False, send_get_body_as='GET', **kwargs):
+
+    DEFAULT_CONNECTION_CLASS = Urllib3HttpConnection
+
+    def __init__(
+        self,
+        hosts,
+        connection_class=None,
+        connection_pool_class=ConnectionPool,
+        host_info_callback=get_host_info,
+        sniff_on_start=False,
+        sniffer_timeout=None,
+        sniff_timeout=0.1,
+        sniff_on_connection_fail=False,
+        serializer=JSONSerializer(),
+        serializers=None,
+        default_mimetype="application/json",
+        max_retries=3,
+        retry_on_status=(502, 503, 504),
+        retry_on_timeout=False,
+        send_get_body_as="GET",
+        **kwargs
+    ):
         """
         :arg hosts: list of dictionaries, each containing keyword arguments to
             create a `connection_class` instance
         :arg connection_class: subclass of :class:`~elasticsearch.Connection` to use
         :arg connection_pool_class: subclass of :class:`~elasticsearch.ConnectionPool` to use
         :arg host_info_callback: callback responsible for taking the node information from
-            `/_cluser/nodes`, along with already extracted information, and
+            `/_cluster/nodes`, along with already extracted information, and
             producing a list of arguments (same as `hosts` parameter)
         :arg sniff_on_start: flag indicating whether to obtain a list of nodes
-            from the cluser at startup time
+            from the cluster at startup time
         :arg sniffer_timeout: number of seconds between automatic sniffs
         :arg sniff_on_connection_fail: flag controlling if connection failure triggers a sniff
         :arg sniff_timeout: timeout used for the sniff request - it should be a
@@ -77,6 +115,8 @@ class Transport(object):
         when creating and instance unless overridden by that connection's
         options provided as part of the hosts parameter.
         """
+        if connection_class is None:
+            connection_class = self.DEFAULT_CONNECTION_CLASS
 
         # serialization config
         _serializers = DEFAULT_SERIALIZERS.copy()
@@ -104,13 +144,27 @@ class Transport(object):
         self.kwargs = kwargs
         self.hosts = hosts
 
-        # ...and instantiate them
-        self.set_connections(hosts)
-        # retain the original connection instances for sniffing
-        self.seed_connections = self.connection_pool.connections[:]
+        # Start with an empty pool specifically for `AsyncTransport`.
+        # It should never be used, will be replaced on first call to
+        # .set_connections()
+        self.connection_pool = EmptyConnectionPool()
+
+        if hosts:
+            # ...and instantiate them
+            self.set_connections(hosts)
+            # retain the original connection instances for sniffing
+            self.seed_connections = list(self.connection_pool.connections[:])
+        else:
+            self.seed_connections = []
+
+        # Don't enable sniffing on Cloud instances.
+        if kwargs.get("cloud_id", False):
+            sniff_on_start = False
+            sniff_on_connection_fail = False
 
         # sniffing data
         self.sniffer_timeout = sniffer_timeout
+        self.sniff_on_start = sniff_on_start
         self.sniff_on_connection_fail = sniff_on_connection_fail
         self.last_sniff = time.time()
         self.sniff_timeout = sniff_timeout
@@ -143,7 +197,7 @@ class Transport(object):
             # if this is not the initial setup look at the existing connection
             # options and identify connections that haven't changed and can be
             # kept around.
-            if hasattr(self, 'connection_pool'):
+            if hasattr(self, "connection_pool"):
                 for (connection, old_host) in self.connection_pool.connection_opts:
                     if old_host == host:
                         return connection
@@ -152,6 +206,7 @@ class Transport(object):
             kwargs = self.kwargs.copy()
             kwargs.update(host)
             return self.connection_class(**kwargs)
+
         connections = map(_create_connection, hosts)
 
         connections = list(zip(connections, hosts))
@@ -159,11 +214,13 @@ class Transport(object):
             self.connection_pool = DummyConnectionPool(connections)
         else:
             # pass the hosts dicts to the connection pool to optionally extract parameters from
-            self.connection_pool = self.connection_pool_class(connections, **self.kwargs)
+            self.connection_pool = self.connection_pool_class(
+                connections, **self.kwargs
+            )
 
     def get_connection(self):
         """
-        Retreive a :class:`~elasticsearch.Connection` instance from the
+        Retrieve a :class:`~elasticsearch.Connection` instance from the
         :class:`~elasticsearch.ConnectionPool` instance.
         """
         if self.sniffer_timeout:
@@ -173,7 +230,7 @@ class Transport(object):
 
     def _get_sniff_data(self, initial=False):
         """
-        Perform the request to get sniffins information. Returns a list of
+        Perform the request to get sniffing information. Returns a list of
         dictionaries (one per node) containing all the information from the
         cluster.
 
@@ -194,31 +251,43 @@ class Transport(object):
                 try:
                     # use small timeout for the sniffing request, should be a fast api call
                     _, headers, node_info = c.perform_request(
-                        'GET', '/_nodes/_all/http',
-                        timeout=self.sniff_timeout if not initial else None)
-                    node_info = self.deserializer.loads(node_info, headers.get('content-type'))
+                        "GET",
+                        "/_nodes/_all/http",
+                        timeout=self.sniff_timeout if not initial else None,
+                    )
+                    node_info = self.deserializer.loads(
+                        node_info, headers.get("content-type")
+                    )
                     break
                 except (ConnectionError, SerializationError):
                     pass
             else:
                 raise TransportError("N/A", "Unable to sniff hosts.")
-        except:
+        except Exception:
             # keep the previous value on error
             self.last_sniff = previous_sniff
             raise
 
-        return list(node_info['nodes'].values())
+        return list(node_info["nodes"].values())
 
     def _get_host_info(self, host_info):
         host = {}
-        address = host_info.get('http', {}).get('publish_address')
+        address = host_info.get("http", {}).get("publish_address")
 
         # malformed or no address given
-        if not address or ':' not in address:
+        if not address or ":" not in address:
             return None
 
-        host['host'], host['port'] = address.rsplit(':', 1)
-        host['port'] = int(host['port'])
+        if "/" in address:
+            # Support 7.x host/ip:port behavior where http.publish_host has been set.
+            fqdn, ipaddress = address.split("/", 1)
+            host["host"] = fqdn
+            _, host["port"] = ipaddress.rsplit(":", 1)
+            host["port"] = int(host["port"])
+
+        else:
+            host["host"], host["port"] = address.rsplit(":", 1)
+            host["port"] = int(host["port"])
 
         return self.host_info_callback(host_info, host)
 
@@ -239,7 +308,9 @@ class Transport(object):
         # we weren't able to get any nodes or host_info_callback blocked all -
         # raise error.
         if not hosts:
-            raise TransportError("N/A", "Unable to sniff hosts - no viable hosts found.")
+            raise TransportError(
+                "N/A", "Unable to sniff hosts - no viable hosts found."
+            )
 
         self.set_connections(hosts)
 
@@ -264,7 +335,7 @@ class Transport(object):
         If an exception was raised, mark the connection as failed and retry (up
         to `max_retries` times).
 
-        If the operation was succesful and the connection used was previously
+        If the operation was successful and the connection used was previously
         marked as dead, mark it as live, resetting it's failure count.
 
         :arg method: HTTP method to use
@@ -273,52 +344,29 @@ class Transport(object):
             underlying :class:`~elasticsearch.Connection` class
         :arg params: dictionary of query parameters, will be handed over to the
             underlying :class:`~elasticsearch.Connection` class for serialization
-        :arg body: body of the request, will be serializes using serializer and
+        :arg body: body of the request, will be serialized using serializer and
             passed to the connection
         """
-        if body is not None:
-            body = self.serializer.dumps(body)
-
-            # some clients or environments don't support sending GET with body
-            if method in ('HEAD', 'GET') and self.send_get_body_as != 'GET':
-                # send it as post instead
-                if self.send_get_body_as == 'POST':
-                    method = 'POST'
-
-                # or as source parameter
-                elif self.send_get_body_as == 'source':
-                    if params is None:
-                        params = {}
-                    params['source'] = body
-                    body = None
-
-        if body is not None:
-            try:
-                body = body.encode('utf-8', 'surrogatepass')
-            except (UnicodeDecodeError, AttributeError):
-                # bytes/str - no need to re-encode
-                pass
-
-        ignore = ()
-        timeout = None
-        if params:
-            timeout = params.pop('request_timeout', None)
-            ignore = params.pop('ignore', ())
-            if isinstance(ignore, int):
-                ignore = (ignore, )
+        method, params, body, ignore, timeout = self._resolve_request_args(
+            method, params, body
+        )
 
         for attempt in range(self.max_retries + 1):
             connection = self.get_connection()
 
             try:
-                # add a delay before attempting the next retry
-                # 0, 1, 3, 7, etc...
-                delay = 2**attempt - 1
-                time.sleep(delay)
-                status, headers_response, data = connection.perform_request(method, url, params, body, headers=headers, ignore=ignore, timeout=timeout)
+                status, headers_response, data = connection.perform_request(
+                    method,
+                    url,
+                    params,
+                    body,
+                    headers=headers,
+                    ignore=ignore,
+                    timeout=timeout,
+                )
 
             except TransportError as e:
-                if method == 'HEAD' and e.status_code == 404:
+                if method == "HEAD" and e.status_code == 404:
                     return False
 
                 retry = False
@@ -330,23 +378,30 @@ class Transport(object):
                     retry = True
 
                 if retry:
-                    # only mark as dead if we are retrying
-                    self.mark_dead(connection)
+                    try:
+                        # only mark as dead if we are retrying
+                        self.mark_dead(connection)
+                    except TransportError:
+                        # If sniffing on failure, it could fail too. Catch the
+                        # exception not to interrupt the retries.
+                        pass
                     # raise exception on last retry
                     if attempt == self.max_retries:
-                        raise
+                        raise e
                 else:
-                    raise
+                    raise e
 
             else:
                 # connection didn't fail, confirm it's live status
                 self.connection_pool.mark_live(connection)
 
-                if method == 'HEAD':
+                if method == "HEAD":
                     return 200 <= status < 300
 
                 if data:
-                    data = self.deserializer.loads(data, headers_response.get('content-type'))
+                    data = self.deserializer.loads(
+                        data, headers_response.get("content-type")
+                    )
                 return data
 
     def close(self):
@@ -354,3 +409,38 @@ class Transport(object):
         Explicitly closes connections
         """
         self.connection_pool.close()
+
+    def _resolve_request_args(self, method, params, body):
+        """Resolves parameters for .perform_request()"""
+        if body is not None:
+            body = self.serializer.dumps(body)
+
+            # some clients or environments don't support sending GET with body
+            if method in ("HEAD", "GET") and self.send_get_body_as != "GET":
+                # send it as post instead
+                if self.send_get_body_as == "POST":
+                    method = "POST"
+
+                # or as source parameter
+                elif self.send_get_body_as == "source":
+                    if params is None:
+                        params = {}
+                    params["source"] = body
+                    body = None
+
+        if body is not None:
+            try:
+                body = body.encode("utf-8", "surrogatepass")
+            except (UnicodeDecodeError, AttributeError):
+                # bytes/str - no need to re-encode
+                pass
+
+        ignore = ()
+        timeout = None
+        if params:
+            timeout = params.pop("request_timeout", None)
+            ignore = params.pop("ignore", ())
+            if isinstance(ignore, int):
+                ignore = (ignore,)
+
+        return method, params, body, ignore, timeout

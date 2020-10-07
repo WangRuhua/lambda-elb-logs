@@ -1,67 +1,100 @@
 import boto3
-import re
-import certifi
+import os
+import gzip
+import json
+from botocore.exceptions import MissingParametersError
 from datetime import datetime
-from elasticsearch import Elasticsearch
 from elasticsearch import helpers
-from aws_requests_auth.boto_utils import BotoAWSRequestsAuth
-from elasticsearch import Elasticsearch, RequestsHttpConnection
+import elasticsearch
+import shlex
 
 
 def lambda_handler(event, context):
-	ELB_KEYS = ["timestamp", "elb", "client_ip", "client_port", "backend_ip", "backend_port", "request_processing_time", "backend_processing_time", "response_processing_time", "elb_status_code", "backend_status_code", "received_bytes", "sent_bytes", "request_method", "request_url", "request_version", "user_agent"]
-	ELB_REGEX = '^(.[^ ]+) (.[^ ]+) (.[^ ]+):(\\d+) (.[^ ]+):(\\d+) (.[^ ]+) (.[^ ]+) (.[^ ]+) (.[^ ]+) (.[^ ]+) (\\d+) (\\d+) \"(\\w+) (.[^ ]+) (.[^ ]+)\" \"(.+)\"'
-	ELB_REGEX_2 = '^(.[^ ]+) (.[^ ]+) (.[^ ]+):(\\d+) (-)( )(.[^ ]+) (.[^ ]+) (.[^ ]+) (.[^ ]+) (\\d+) (\\d+) (\\d+) \"(\\w+) (.[^ ]+) (.[^ ]+)\" \"(.+)\"'
-	R = re.compile(ELB_REGEX)
-	R2 = re.compile(ELB_REGEX_2)
+    print("type of message",type(event['Records'][0]['Sns']['Message']))
+    message = event['Records'][0]['Sns']['Message']
+    if isinstance( message,str):
+        tmp_message = json.loads(message)
+        s3_message = tmp_message['Records'][0]['s3']
+    else:
+        s3_message = event['Records'][0]['Sns']['Message']['Records'][0]['s3']
+    ## find the latest elb log fields here:https://docs.aws.amazon.com/elasticloadbalancing/latest/application/load-balancer-access-logs.html#access-log-entry-format
+    ELB_FIELD = ["elb.type",
+                "elb.time",
+                "elb.name",
+                "elb.client_ip",
+                "elb.target_ip",
+                "elb.request_processing_time",
+                "elb.target_processing_time",
+                "elb.response_processing_time",
+                "elb.elb_status_code",
+                "elb.target_status_code",
+                "elb.received_bytes",
+                "elb.sent_bytes",
+                "elb.request",
+                "elb.user_agent",
+                "elb.ssl_cipher",
+                "elb.ssl_protocol",
+                "elb.target_group_arn",
+                "elb.trace_id",
+                "elb.domain_name",
+                "elb.chosen_cert_arn",
+                "elb.matched_rule_priority",
+                "elb.request_creation_time",
+                "elb.actions_executed",
+                "elb.redirect_url",
+                "elb.error_reason",
+                "elb.target_port_list",
+                "elb.target_status_code_list",
+                "elb.classification",
+                "elb.classification_reason"
+                ]
+    ES_HOST = os.environ['ELASTIC_ENDPOINT']
+    ES_REGION = os.environ['ES_REGION']
+    INDEX_PREFIX = "aws.elb"
+    #print(ES_HOST)
+    #print(INDEX_PREFIX)
+    today=datetime.utcnow().date()
+    INDEX_PREFIX = INDEX_PREFIX + "-" + today.strftime("%Y-%m") 
+    es = elasticsearch.Elasticsearch(ES_HOST, verify_certs=True, timeout = 60)
+    try:
+        es.indices.create(index=INDEX_PREFIX, ignore=400,timeout = 30)
+        print("index created",INDEX_PREFIX)
+    except elasticsearch.ConnectionError as  e:
+        print("create index failed",e)
+    except Exception as e:
+        print("error:",e)
 
-	ES_HOST = environ['ELASTIC_ENDPOINT']
-	ES_REGION = environ['ES_REGION']
-	INDEX_PREFIX = ""
-	BUCKET_NAME = environ['BUCKET_NAME']
 
-	auth = BotoAWSRequestsAuth(aws_host=ES_HOST,
-						   aws_region=ES_REGION,
-						   aws_service='es')
-	es = Elasticsearch(host=ES_HOST, port=443, use_ssl=True, ca_certs=certifi.where(), connection_class=RequestsHttpConnection, http_auth=auth)
-	actions = []
-	elb_name = ""
-	error=0
+    actions = []
+    s3 = boto3.resource("s3")
 
-	s3 = boto3.client("s3")
-	if event:
-		print("Event:", event)
-		file_obj = event["Records"][0]
-		filename = str(file_obj['s3']['object']['key'])
-		print("Filename: ", filename)
-		fileObj = s3.get_object(Bucket = BUCKET_NAME, Key=filename)
-		file_content = fileObj["Body"].read().decode('utf-8')
-		#print(file_content)
-		for line in file_content.strip().split("\n"):
-			match = R.match(line)
-			if not match:
-				match = R2.match(line)
-				if not match:
-					error=error+1
-					print("Error: ",line)
-					continue
+    if s3_message:
+        filename = s3_message['object']['key']
+        bucketname = s3_message['bucket']['name']
+        file_obj = s3.Object(bucketname, filename)
+        #print("Filename: ", filename, "\n", "bucket:", bucketname)
+        with gzip.GzipFile(fileobj=file_obj.get()["Body"]) as gzipfile:
+            file_content = gzipfile.read()
+        file_content = file_content.decode('utf-8')
+        #print(file_content)
+        for line in file_content.strip().split("\n"):
+            #print("----------------------")
+            #print("orogin line:")
+            new_line = shlex.split(line)
+            #print(ELB_FIELD)
+            #print(new_line)
+            doc = dict(zip(ELB_FIELD, new_line))
+            doc["elb.client_ip"] = doc["elb.client_ip"].split(':')[0]
+            doc["elb.target_ip"] = doc["elb.target_ip"].split(':')[0]
+            doc["elb.request_method"],doc["elb.request_url"],doc["elb.request_protocol"] = doc["elb.request"].split()
+            
+            actions.append(
+                {"_index": INDEX_PREFIX,"_source": doc})
 
-			values = match.groups(0)
-			if not elb_name:
-				elb_name = ("%s_doc") %(values[1])
-				INDEX_PREFIX = ("%s-%s-w%s") %(values[1], datetime.now().isocalendar()[0], datetime.now().isocalendar()[1])
-				print values[1]
-			doc = dict(zip(ELB_KEYS, values))
-			#print doc
-
-			actions.append({"_index": INDEX_PREFIX, "_type": elb_name, "_source": doc})
-
-			if len(actions) > 300:
-				helpers.bulk(es, actions)
-				print("bulk elastic")
-				actions = []
-
-		if len(actions) > 0:
-			print("end bulk elastic")
-			helpers.bulk(es, actions)
-		print("erros:", error)
+        try:
+            helpers.bulk(es, actions)
+            print("data were pushed successfully")
+        except Exception as e:
+            print("push data failed:",e)
+        else:
+            print("bulk elastic done")
