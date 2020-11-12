@@ -1,0 +1,34 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: 'AWS::Serverless-2016-10-31'
+Description: send elb logs to elastic search
+Resources:
+  proddevopssendlog2es:
+    Type: 'AWS::Serverless::Function'
+    Properties:
+      FunctionName: prod-devops-elblog2es
+      Handler: lambda_function.lambda_handler
+      Runtime: python3.8
+      Events:
+        SnsEvent:
+          Type: SNS 
+          Properties:
+            Topic: arn:aws:sns:us-east-1:aws-account-id:prod-devops-s3-event-elblog
+      #Codeuri:
+      #  Zipfile:fileb://elblog2es.zip
+      CodeUri: ./
+      Description: send elb logs to elastic search
+      MemorySize: 128
+      Timeout: 160
+      Role: 'arn:aws:iam::aws-account-id:role/lambda_elasticsearch_execution'
+      Environment:
+        Variables:
+          ELASTIC_ENDPOINT : "elasticsearch""
+          ES_REGION : "us-east-1"
+          INDEX_PREFIX : "elblogs"
+      VpcConfig:
+        SecurityGroupIds:
+          - sg-id
+        SubnetIds:
+          - subnet-id
+      Tags:
+          team:devops
